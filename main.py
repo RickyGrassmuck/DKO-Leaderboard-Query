@@ -1,40 +1,105 @@
-import requests
-from pprint import pprint as pp
+import click
+import pytesseract
+from lib import lookup, ocr, utils
+import time
+from typing import TypedDict
 
-twos = 469
-ones = 511
-queues = [{"id": 469, "name": "2v2"}, {"id": 511, "name": "1v1"}]
-god_keys = ["god_1", "god_2", "god_3"]
-bros_of_the_sun = ["JovialWalrus", "joyrida", "pazapaza", "wheels775", "maofish"] 
+class QueueDetection(TypedDict):
+  Name: str
+  Valid: bool
 
-def get_leaderboard():
-    r = requests.get("https://api2.hirezstudios.com/stats/leaderboard")
-    results = r.json()
-    leaders = results["rows"]
-    _temp_lb = {"1v1": {}, "2v2": {}}
-    leaderboard = {"1v1": {}, "2v2": {}}
-    _temp_lb["1v1"] = [player for player in leaders if player["match_queue_id"] == ones]
-    _temp_lb["2v2"] = [player for player in leaders if player["match_queue_id"] == twos]
-    for queue in queues:
-      for player in _temp_lb[queue["name"]]:
-        gods = []
-        for god in god_keys:
-          if player[god] != "null":
-            gods.append(player[god])
-        leaderboard[queue["name"]][player["ranking"]] = {
-          "player_name": player['player_name'],
-          "gods": gods
-        }
-    return leaderboard
+class Opponents(TypedDict):
+  Name: str
+  Valid: bool
 
-if __name__ == "__main__":
-    leaders = get_leaderboard()
-    for bro in bros_of_the_sun:
-      found = False
-      for queue in queues:
-        for rank in leaders[queue["name"]]:
-          if leaders[queue["name"]][rank]["player_name"] == bro:
-            found = True
-            print(f"{bro} is rank {rank} in {queue['name']}")
-      if not found:
-        print(f"{bro} is not in the top 500 in any queue, git gud scrub")
+def detect_queue() -> QueueDetection:
+  result = QueueDetection(Name="", Valid=False)
+  queue_detect_box = ocr.BOXES["queue_detection"]
+  valid_queues = queue_detect_box["valid_queues"]
+  detected = False
+  while not detected:
+    found = ocr.detect_screen(queue_detect_box)
+    if found:
+      print("Queue detected")
+      detected = True
+      break
+    time.sleep(2)
+
+  process_results = ocr.process_locations(queue_detect_box["locations"], text_to_lower=True)
+  if len(process_results) == 0:
+    print("No queue text detected")
+    return result
+  queue_text = process_results[0]
+  print(f"Found queue text: {queue_text}")
+  for queue in valid_queues:
+    filtered = ocr.filter_characters(queue_text, queue['name'])
+    if ocr.contains_characters(filtered, queue['must_contain']):
+      result["Name"] = queue['name']
+      result["Valid"] = True
+      break
+  else:
+    result["Name"] = queue_text
+  return result
+
+def detect_opponent_names(box: dict, queue: str):
+  while ocr.detect_screen(box):
+    results = ocr.process_locations(ocr.BOXES["character_selection"][queue]['locations'], text_to_lower=False)
+    if len(results) > 0:
+      return results
+    time.sleep(3)
+  return None
+
+
+
+@click.command()
+@click.option('--tesseract-cmd', default=r'C:\Program Files\Tesseract-OCR\tesseract.exe', help='Location of the tesseract executable.')
+def run(tesseract_cmd):
+    pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+    print("Starting...")
+    leaders = lookup.Leaderboard()      
+    while True:
+      # Detect queue
+      print("Waiting for queue to start...")
+      queue_detection = detect_queue()
+      while not queue_detection["Valid"]:
+        print(f"Invalid queue name detected {queue_detection['Name']}")
+        time.sleep(5)
+        queue_detection = detect_queue()
+
+      # Valid queue was detected, waiting for character selection screen
+      print(f"Valid Queue Name detected: {queue_detection['Name']}, waiting for match to start...")
+      char_select_box = ocr.BOXES["character_selection"][queue_detection["Name"]]
+      while not ocr.detect_screen(char_select_box):
+        time.sleep(3)
+      
+      # Character selection screen detected, looking for opponent names
+      print("Found character selection screen, looking for opponent names...")
+      opponents = detect_opponent_names(char_select_box, queue_detection["Name"])
+      if (opponents is not None) and (len(opponents) > 0):
+        # Since we extracted opponent names, we can sleep long enough to get
+        # past the character selection screen and start the loop over
+        sleep_time = 30 
+        #Looking up opponents on leaderboard
+        matches = []
+        for opponent in opponents:
+          leaderboard_entries = leaders.lookup(opponent)
+          if len(leaderboard_entries) > 0:
+            matches.extend(leaderboard_entries)
+        
+        if len(matches) == 0:
+          print(f"Not found on the leaderboard: {', '.join(opponents)}, have fun!")
+        else:
+          body = []
+          for match in matches:
+            body.append(f"Player: {match['name']} | Queue: {match['queue']} | Rank: {match['rank']} | Gods: {', '.join(match['gods'])}")
+          
+          utils.print_surrounded("Leaderboard Alert", '\n'.join(body))
+        print("Good luck! Restarting detection...")
+      else:
+        print("No opponents were able to be detected, restarting detection...")
+
+
+
+if __name__ == '__main__':
+    run()
+
